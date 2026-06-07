@@ -1,15 +1,72 @@
-from flask import Flask, request, jsonify, render_template_string
+import os
+import sqlite3
+import logging
+from flask import Flask, request, jsonify, render_template_string, g
+
+# Configurar logging de producción
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Cargar variables de entorno si python-dotenv está disponible
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    logger.info("Variables de entorno cargadas desde archivo .env")
+except ImportError:
+    logger.info("python-dotenv no está instalado. Se usarán las variables de entorno del sistema.")
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
 
-# Base de datos en memoria para tareas
-todos = [
-    {"id": 1, "titulo": "Hacer tarea de la universidad", "completada": False},
-    {"id": 2, "titulo": "Hacer aseo", "completada": False},
-    {"id": 3, "titulo": "Leer capitulo 5 de libro de clase", "completada": True}
-]
+# Base de datos SQLite para producción (persistencia compatible con múltiples workers de Gunicorn)
+DATABASE = os.environ.get("DATABASE_PATH", "database.db")
 
-# --- VISTA HTML (Frontend Minimalista) ---
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                titulo TEXT NOT NULL,
+                completada BOOLEAN NOT NULL DEFAULT 0
+            )
+        """)
+        db.commit()
+        
+        # Insertar datos iniciales si está vacía
+        cursor.execute("SELECT COUNT(*) FROM todos")
+        if cursor.fetchone()[0] == 0:
+            cursor.executemany("""
+                INSERT INTO todos (titulo, completada) VALUES (?, ?)
+            """, [
+                ("Hacer tarea de la universidad", 0),
+                ("Hacer aseo", 0),
+                ("Leer capitulo 5 de libro de clase", 1)
+            ])
+            db.commit()
+            logger.info("Base de datos SQLite inicializada con datos por defecto.")
+
+# --- VISTA HTML (Frontend autocontenido) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -125,7 +182,6 @@ HTML_TEMPLATE = """
             padding-right: 2px;
         }
 
-        /* Scrollbar custom style */
         .todo-list::-webkit-scrollbar {
             width: 6px;
         }
@@ -247,7 +303,6 @@ HTML_TEMPLATE = """
     <script>
         const API_URL = '/todos';
 
-        // Cargar las tareas al iniciar
         document.addEventListener('DOMContentLoaded', fetchTodos);
 
         async function fetchTodos() {
@@ -353,7 +408,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- RUTAS DE LA API ---
+# --- RUTAS DE LA APLICACIÓN ---
 
 @app.route("/")
 def home():
@@ -361,42 +416,99 @@ def home():
 
 @app.route("/todos", methods=["GET"])
 def obtener_todos():
-    return jsonify(todos), 200
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id, titulo, completada FROM todos ORDER BY id ASC")
+    rows = cursor.fetchall()
+    res = [{"id": r["id"], "titulo": r["titulo"], "completada": bool(r["completada"])} for r in rows]
+    return jsonify(res), 200
 
 @app.route("/todos", methods=["POST"])
 def agregar_todo():
     data = request.get_json()
-    if not data or "titulo" not in data:
+    if not data or "titulo" not in data or not data["titulo"].strip():
         return jsonify({"error": "Falta el campo 'titulo'"}), 400
     
-    nuevo_id = max([t["id"] for t in todos], default=0) + 1
+    titulo = data["titulo"].strip()
+    completada = int(data.get("completada", False))
+    
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("INSERT INTO todos (titulo, completada) VALUES (?, ?)", (titulo, completada))
+    db.commit()
+    
+    nuevo_id = cursor.lastrowid
     nueva_tarea = {
         "id": nuevo_id,
-        "titulo": data["titulo"],
-        "completada": data.get("completada", False)
+        "titulo": titulo,
+        "completada": bool(completada)
     }
-    todos.append(nueva_tarea)
     return jsonify(nueva_tarea), 201
 
 @app.route("/todos/<int:id>", methods=["PUT"])
 def actualizar_todo(id):
     data = request.get_json()
-    for t in todos:
-        if t["id"] == id:
-            t["titulo"] = data.get("titulo", t["titulo"])
-            t["completada"] = data.get("completada", t["completada"])
-            return jsonify(t), 200
-    return jsonify({"error": "Tarea no encontrada"}), 404
+    if not data:
+        return jsonify({"error": "Petición vacía"}), 400
+        
+    db = get_db()
+    cursor = db.cursor()
+    
+    cursor.execute("SELECT id, titulo, completada FROM todos WHERE id = ?", (id,))
+    row = cursor.fetchone()
+    if not row:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+    
+    titulo = data.get("titulo", row["titulo"]).strip()
+    completada = int(data.get("completada", row["completada"]))
+    
+    cursor.execute("UPDATE todos SET titulo = ?, completada = ? WHERE id = ?", (titulo, completada, id))
+    db.commit()
+    
+    return jsonify({
+        "id": id,
+        "titulo": titulo,
+        "completada": bool(completada)
+    }), 200
 
 @app.route("/todos/<int:id>", methods=["DELETE"])
 def eliminar_todo(id):
-    for i, t in enumerate(todos):
-        if t["id"] == id:
-            eliminado = todos.pop(i)
-            return jsonify(eliminado), 200
-    return jsonify({"error": "Tarea no encontrada"}), 404
+    db = get_db()
+    cursor = db.cursor()
+    
+    cursor.execute("SELECT id, titulo, completada FROM todos WHERE id = ?", (id,))
+    row = cursor.fetchone()
+    if not row:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+        
+    cursor.execute("DELETE FROM todos WHERE id = ?", (id,))
+    db.commit()
+    
+    return jsonify({
+        "id": row["id"],
+        "titulo": row["titulo"],
+        "completada": bool(row["completada"])
+    }), 200
+
+# --- CONTROLADORES DE ERRORES ---
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return jsonify({"error": "Recurso no encontrado"}), 404
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    logger.error(f"Error de servidor no manejado: {e}")
+    return jsonify({"error": "Error interno del servidor"}), 500
+
+# Inicializar base de datos SQLite
+init_db()
 
 if __name__ == "__main__":
-    # Escucha en todas las interfaces de red (0.0.0.0) y puerto 5000 por defecto
-    # Esto es ideal para probar localmente y prepararse para el despliegue.
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Configuración de red para escuchar en todas las interfaces (0.0.0.0) y puerto personalizable
+    host = os.environ.get("FLASK_RUN_HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "True").lower() in ("true", "1", "t")
+    
+    logger.info(f"Iniciando servidor Flask en {host}:{port} (debug={debug})")
+    app.run(host=host, port=port, debug=debug)

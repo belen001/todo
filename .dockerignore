@@ -1,0 +1,30 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bases de datos locales
+*.db
+*.sqlite3
+database.db
+
+# Configuración y variables locales
+.env
+.git/
+.gitignore
+.dockerignore
+README.md
+
+# Archivos de herramientas o IDEs
+.vscode/
+.idea/
+.gemini/
+brain/
+artifacts/
